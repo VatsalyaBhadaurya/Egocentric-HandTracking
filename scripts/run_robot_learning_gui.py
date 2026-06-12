@@ -44,6 +44,10 @@ def main():
                         help="RealSense colour/depth stream height")
     parser.add_argument("--rs-fps",    type=int, default=30,
                         help="RealSense colour/depth stream frame rate")
+    parser.add_argument("--enable-ik", action="store_true",
+                        help="retarget the tracked right hand to SO-101 right-arm "
+                             "joint angles via the vbhs PyBullet IK solver; "
+                             "requires --camera-backend realsense")
     args = parser.parse_args()
 
     pipeline = RobotLearningHandPipeline(
@@ -58,6 +62,7 @@ def main():
         rs_width       = args.rs_width,
         rs_height      = args.rs_height,
         rs_fps         = args.rs_fps,
+        enable_ik      = args.enable_ik,
     )
     pipeline.run()
 

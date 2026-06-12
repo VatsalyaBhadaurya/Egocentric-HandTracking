@@ -31,6 +31,14 @@ INTERHAND_TO_MEDIAPIPE: dict[int, str] = {
 }
 
 
+def to_vbhs_intrinsics(intrinsics) -> vbhs_types.CameraIntrinsics:
+    # Converts our src.camera.Intrinsics into vbhs's CameraIntrinsics. `fov`
+    # is unused by deprojection (which works from fx/fy/ppx/ppy) so it's left at 0.
+    return vbhs_types.CameraIntrinsics(
+        fov=0.0, width=intrinsics.width, height=intrinsics.height,
+        fx=intrinsics.fx, fy=intrinsics.fy, ppx=intrinsics.ppx, ppy=intrinsics.ppy)
+
+
 def hand_state_to_pose2d(keypoints: np.ndarray) -> vbhs_types.HandPose2D:
     # Builds a MediaPipe-keyed {name: (u, v)} dict from our 21x{2,3} keypoint array.
     return {name: (float(keypoints[idx, 0]), float(keypoints[idx, 1]))

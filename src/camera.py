@@ -1,8 +1,21 @@
 # Author: adith
 # OpenCV VideoCapture wrapper that always returns the latest frame
 
+from dataclasses import dataclass
+
 import cv2
 import numpy as np
+
+
+@dataclass
+class Intrinsics:
+    """Pinhole camera intrinsics, in pixels."""
+    width: int
+    height: int
+    fx: float
+    fy: float
+    ppx: float
+    ppy: float
 
 
 class ThreadedCamera:
@@ -46,6 +59,14 @@ class RealSenseCamera:
         profile = self.pipeline.start(config)
         self.depth_scale = profile.get_device().first_depth_sensor().get_depth_scale()
         self.align = rs.align(rs.stream.color)
+
+        # Depth is aligned to the colour stream, so the colour stream's
+        # intrinsics apply to both the returned frame and its depth map.
+        color_intr = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+        self.intrinsics = Intrinsics(
+            width=color_intr.width, height=color_intr.height,
+            fx=color_intr.fx, fy=color_intr.fy,
+            ppx=color_intr.ppx, ppy=color_intr.ppy)
 
         self._last_depth: np.ndarray | None = None
 

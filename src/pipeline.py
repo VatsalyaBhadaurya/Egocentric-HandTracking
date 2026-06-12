@@ -27,6 +27,8 @@ from .one_euro_filter     import OneEuroFilter
 from .pose_backends       import MMPoseHandBackend
 from .robot_mapper        import SimpleArmRetargeter
 from .state               import FrameState
+from .vbhs_bridge         import hand_state_to_pose3d, to_vbhs_intrinsics
+from .ik_retargeter       import SingleArmIKRetargeter
 
 _BGR = [(203,192,255), (50,100,255), (50,205,50), (0,165,255), (147,112,219)]
 _RGB = [(r/255, g/255, b/255) for (b, g, r) in _BGR]
@@ -331,7 +333,8 @@ class RobotLearningHandPipeline:
                  depth_model="", da2_encoder="vitl", infer_scale=0.6,
                  report_dir=".", camera_index=0,
                  camera_backend="opencv",
-                 rs_width=1280, rs_height=720, rs_fps=30):
+                 rs_width=1280, rs_height=720, rs_fps=30,
+                 enable_ik=False):
         device = _resolve_device(device)
         self.using_realsense = camera_backend == "realsense"
 
@@ -364,6 +367,12 @@ class RobotLearningHandPipeline:
                          GestureAbstractor(history=5)]
         self.actions  = HandActionEncoder()
         self.retargeter = SimpleArmRetargeter(image_size=(CAM_W, CAM_H))
+
+        # Single-arm (right hand -> SO-101 right arm) IK retargeting via the
+        # vendored vbhs pipeline. Needs real camera intrinsics, so only
+        # available on the RealSense backend.
+        self.enable_ik = bool(enable_ik) and self.using_realsense
+        self.ik_retargeter = SingleArmIKRetargeter(gui=False) if self.enable_ik else None
 
         self._fig = plt.figure(figsize=(PLOT_W/100, PLOT_H/100),
                                dpi=100, facecolor="white")
@@ -636,6 +645,28 @@ class RobotLearningHandPipeline:
         cv2.putText(frame, txt, (tx, ty),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.36, (0, 255, 255), 1, cv2.LINE_AA)
 
+    def _draw_ik_solution(self, frame, hand_state, result):
+        # Shows the SO-101 right-arm joint angles (degrees) solved by the
+        # vbhs PyBullet IK solver for the tracked right hand, or a "no
+        # solution" notice when the target was unreachable/rejected.
+        H, W = frame.shape[:2]
+        cx, cy = hand_state.palm_center_2d
+        cx, cy = int(round(float(cx))), int(round(float(cy)))
+        tx = int(np.clip(cx - 110, 2, W - 330))
+        ty = int(np.clip(cy + 50, 12, H - 4))
+
+        if result.joint_angles is None:
+            cv2.putText(frame, "SO-101: no IK solution", (tx, ty),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.36, (0, 140, 255), 1, cv2.LINE_AA)
+            return
+
+        deg = np.degrees(result.joint_angles)
+        txt = ("SO-101 j1-6deg "
+               f"{deg[0]:+.0f} {deg[1]:+.0f} {deg[2]:+.0f} "
+               f"{deg[3]:+.0f} {deg[4]:+.0f} {deg[5]:+.0f}")
+        cv2.putText(frame, txt, (tx, ty),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, (255, 200, 0), 1, cv2.LINE_AA)
+
     def _render_3d(self, hands_data, title):
         # Renders the current hand skeletons onto a Matplotlib 3D axes and returns a BGR numpy image.
         ax = self._ax; ax.cla()
@@ -808,6 +839,18 @@ class RobotLearningHandPipeline:
                 if hand_state.visible:
                     self._draw_ik_target(vis, hand_state, arm_cmd)
 
+            if self.ik_retargeter is not None:
+                right_hand = next(
+                    (hs for hs in hand_states if hs.visible and hs.side == "right"),
+                    next((hs for hs in hand_states if hs.visible and hs.slot == 0), None))
+                if right_hand is not None:
+                    pose3d = hand_state_to_pose3d(
+                        right_hand.keypoints, right_hand.scores,
+                        depth_map, to_vbhs_intrinsics(self.cam.intrinsics),
+                        joint_thr=self.score_thr)
+                    ik_result = self.ik_retargeter.step(pose3d)
+                    self._draw_ik_solution(vis, right_hand, ik_result)
+
             self._draw_session_overlay(vis)
 
             self._draw_legend(vis)
@@ -839,3 +882,5 @@ class RobotLearningHandPipeline:
         plt.close(self._fig)
         self.cam.release()
         cv2.destroyAllWindows()
+        if self.ik_retargeter is not None:
+            self.ik_retargeter.close()
