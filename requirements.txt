@@ -11,6 +11,10 @@ numpy>=1.24.0
 # Data visualization & plotting
 matplotlib>=3.7.0
 
+# Inverse kinematics (Egocentric-IK / vbhs integration)
+pybullet>=3.2.5
+scipy>=1.10.0
+
 # Optional: For GPU support (uncomment if needed)
 # torch-cuda-11.8
 # torch-cuda-12.1
