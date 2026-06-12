@@ -48,6 +48,17 @@ def main():
                         help="retarget the tracked right hand to SO-101 right-arm "
                              "joint angles via the vbhs PyBullet IK solver; "
                              "requires --camera-backend realsense")
+    parser.add_argument("--enable-robot", action="store_true",
+                        help="drive a physical LeRobot SO-101 follower arm from "
+                             "the IK solution; requires --enable-ik and --robot-port. "
+                             "Starts in standby; press 'g' in the window to arm it "
+                             "and 's' to return to standby")
+    parser.add_argument("--robot-port", default="",
+                        help="serial port of the SO-101 follower arm "
+                             "(e.g. COM3 or /dev/ttyACM0)")
+    parser.add_argument("--robot-id", default="right_follower",
+                        help="LeRobot robot id / calibration file name for the "
+                             "SO-101 follower arm")
     args = parser.parse_args()
 
     pipeline = RobotLearningHandPipeline(
@@ -63,6 +74,9 @@ def main():
         rs_height      = args.rs_height,
         rs_fps         = args.rs_fps,
         enable_ik      = args.enable_ik,
+        enable_robot   = args.enable_robot,
+        robot_port     = args.robot_port,
+        robot_id       = args.robot_id,
     )
     pipeline.run()
 

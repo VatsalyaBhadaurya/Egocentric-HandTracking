@@ -29,6 +29,7 @@ from .robot_mapper        import SimpleArmRetargeter
 from .state               import FrameState
 from .vbhs_bridge         import hand_state_to_pose3d, to_vbhs_intrinsics
 from .ik_retargeter       import SingleArmIKRetargeter
+from .robot_driver         import SO101FollowerDriver
 
 _BGR = [(203,192,255), (50,100,255), (50,205,50), (0,165,255), (147,112,219)]
 _RGB = [(r/255, g/255, b/255) for (b, g, r) in _BGR]
@@ -334,7 +335,8 @@ class RobotLearningHandPipeline:
                  report_dir=".", camera_index=0,
                  camera_backend="opencv",
                  rs_width=1280, rs_height=720, rs_fps=30,
-                 enable_ik=False):
+                 enable_ik=False,
+                 enable_robot=False, robot_port="", robot_id="right_follower"):
         device = _resolve_device(device)
         self.using_realsense = camera_backend == "realsense"
 
@@ -373,6 +375,21 @@ class RobotLearningHandPipeline:
         # available on the RealSense backend.
         self.enable_ik = bool(enable_ik) and self.using_realsense
         self.ik_retargeter = SingleArmIKRetargeter(gui=False) if self.enable_ik else None
+
+        # Drives a physical LeRobot SO-101 follower arm from the IK solution
+        # above. Requires --enable-ik and a serial port for the arm; if the
+        # connection fails, the pipeline keeps running with the robot disabled.
+        self.robot_driver = None
+        # Starts disarmed (holding standby) until the user presses 'g'; press
+        # 's' at any time to send standby and disarm again.
+        self._robot_armed = False
+        self.enable_robot = bool(enable_robot) and self.enable_ik and bool(robot_port)
+        if self.enable_robot:
+            try:
+                self.robot_driver = SO101FollowerDriver(port=robot_port, robot_id=robot_id)
+            except Exception as e:
+                print(f"[robot] Failed to connect to SO-101 follower on {robot_port!r}: {e}")
+                self.enable_robot = False
 
         self._fig = plt.figure(figsize=(PLOT_W/100, PLOT_H/100),
                                dpi=100, facecolor="white")
@@ -612,8 +629,12 @@ class RobotLearningHandPipeline:
         cv2.putText(frame,
                     f"FPS:{self.fps:.1f}  Hands:{n}  {self.depth_label}/{cal}",
                     (12,H-8),cv2.FONT_HERSHEY_SIMPLEX,0.44,(160,160,160),1)
-        cv2.putText(frame,"c=calibrate  r=reset  ESC=quit",
-                    (W-260,H-8),cv2.FONT_HERSHEY_SIMPLEX,0.36,(120,120,120),1)
+        hint = "c=calibrate  r=reset  ESC=quit"
+        if self.enable_robot:
+            armed = "ARMED" if self._robot_armed else "STANDBY"
+            hint += f"  g=arm  s=standby  [{armed}]"
+        cv2.putText(frame, hint,
+                    (W-360,H-8),cv2.FONT_HERSHEY_SIMPLEX,0.36,(120,120,120),1)
 
     def _draw_action_label(self, frame, hand_state, action):
         x = int(np.clip(hand_state.palm_center_2d[0] - 85, 4, frame.shape[1] - 170))
@@ -851,6 +872,10 @@ class RobotLearningHandPipeline:
                     ik_result = self.ik_retargeter.step(pose3d)
                     self._draw_ik_solution(vis, right_hand, ik_result)
 
+                    if (self.enable_robot and self._robot_armed
+                            and ik_result.joint_angles is not None):
+                        self.robot_driver.send(ik_result.joint_angles)
+
             self._draw_session_overlay(vis)
 
             self._draw_legend(vis)
@@ -871,6 +896,11 @@ class RobotLearningHandPipeline:
                 self.calib_active = True
                 self.calib_start  = time.time()
                 self.depth.begin_calibration()
+            elif key == ord('g') and self.enable_robot:
+                self._robot_armed = True
+            elif key == ord('s') and self.enable_robot:
+                self._robot_armed = False
+                self.robot_driver.send_standby()
             elif key == ord('r'):
                 self.depth.fusion.reset()
                 self.calib_done   = self.calib_done_default
@@ -884,3 +914,5 @@ class RobotLearningHandPipeline:
         cv2.destroyAllWindows()
         if self.ik_retargeter is not None:
             self.ik_retargeter.close()
+        if self.robot_driver is not None:
+            self.robot_driver.close()
