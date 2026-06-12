@@ -25,6 +25,7 @@ from .depth_estimator     import DepthEstimator, RealSenseDepthEstimator
 from .gesture_abstraction import GestureAbstractor, FINGER_CHAINS_IDX, WRIST, FINGER_TIPS
 from .one_euro_filter     import OneEuroFilter
 from .pose_backends       import MMPoseHandBackend
+from .robot_mapper        import SimpleArmRetargeter
 from .state               import FrameState
 
 _BGR = [(203,192,255), (50,100,255), (50,205,50), (0,165,255), (147,112,219)]
@@ -362,6 +363,7 @@ class RobotLearningHandPipeline:
         self.gestures = [GestureAbstractor(history=5),
                          GestureAbstractor(history=5)]
         self.actions  = HandActionEncoder()
+        self.retargeter = SimpleArmRetargeter(image_size=(CAM_W, CAM_H))
 
         self._fig = plt.figure(figsize=(PLOT_W/100, PLOT_H/100),
                                dpi=100, facecolor="white")
@@ -612,6 +614,28 @@ class RobotLearningHandPipeline:
         cv2.putText(frame, txt, (x + 4, y + 14),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, (220, 220, 220), 1, cv2.LINE_AA)
 
+    def _draw_ik_target(self, frame, hand_state, arm_cmd):
+        # Marks the palm-centroid IK target (the point a 6-DoF arm end-effector
+        # should track) and prints the retargeted joint/gripper command beside it.
+        H, W = frame.shape[:2]
+        cx, cy = hand_state.palm_center_2d
+        cx, cy = int(round(float(cx))), int(round(float(cy)))
+        if not (0 <= cx < W and 0 <= cy < H):
+            return
+
+        cv2.drawMarker(frame, (cx, cy), (0, 255, 255),
+                       markerType=cv2.MARKER_TILTED_CROSS, markerSize=16,
+                       thickness=2, line_type=cv2.LINE_AA)
+        cv2.circle(frame, (cx, cy), 5, (0, 255, 255), 2, cv2.LINE_AA)
+
+        j = arm_cmd.joint_targets
+        txt = (f"IK xyz {j[0]:+.2f} {j[1]:+.2f} {j[2]:+.2f}  "
+               f"rpy {j[3]:+.2f} {j[4]:+.2f} {j[5]:+.2f}  grip {arm_cmd.gripper:.2f}")
+        tx = int(np.clip(cx - 110, 2, W - 330))
+        ty = int(np.clip(cy + 34, 12, H - 4))
+        cv2.putText(frame, txt, (tx, ty),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, (0, 255, 255), 1, cv2.LINE_AA)
+
     def _render_3d(self, hands_data, title):
         # Renders the current hand skeletons onto a Matplotlib 3D axes and returns a BGR numpy image.
         ax = self._ax; ax.cla()
@@ -641,6 +665,14 @@ class RobotLearningHandPipeline:
             if len(pb)>=2:
                 ax.plot([px[j] for j in pb],[py[j] for j in pb],[pz[j] for j in pb],
                         color=(0.75,0.75,0.75),linewidth=1.0)
+            if pb:
+                # IK target: palm centroid (wrist + finger-MCP arc), the point
+                # an external 6-DoF arm controller should track.
+                cxp=float(np.mean([px[j] for j in pb]))
+                cyp=float(np.mean([py[j] for j in pb]))
+                czp=float(np.mean([pz[j] for j in pb]))
+                ax.scatter([cxp],[cyp],[czp],color="gold",s=60,marker="*",
+                           zorder=6,depthshade=False,edgecolors="black",linewidths=0.4)
 
         if all_pts:
             pts=np.concatenate(all_pts,axis=0)
@@ -761,15 +793,20 @@ class RobotLearningHandPipeline:
 
             self.stats.update(fps_now, hands, metas_out, depths_out)
             actions = self.actions.encode(hand_states, frame_t)
+            arm_commands = [self.retargeter.map(hs, act)
+                            for hs, act in zip(hand_states, actions)]
             self.last_frame_state = FrameState(
                 timestamp=frame_t,
                 fps=fps_now,
                 hands=hand_states,
                 actions=actions,
+                arm_commands=arm_commands,
             )
 
-            for hand_state, action in zip(hand_states, actions):
+            for hand_state, action, arm_cmd in zip(hand_states, actions, arm_commands):
                 self._draw_action_label(vis, hand_state, action)
+                if hand_state.visible:
+                    self._draw_ik_target(vis, hand_state, arm_cmd)
 
             self._draw_session_overlay(vis)
 

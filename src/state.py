@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from .robot_mapper import ArmCommand
 
 
 @dataclass(eq=False)
@@ -51,4 +54,5 @@ class FrameState:
     fps: float
     hands: list[HandState]
     actions: list[HandAction] = field(default_factory=list)
+    arm_commands: list[ArmCommand] = field(default_factory=list)
 
