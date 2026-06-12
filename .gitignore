@@ -1,0 +1,19 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+
+# Model checkpoints — large binaries, fetched per README setup instructions
+*.pth
+checkpoints/depth_anything_v2/Depth-Anything-V2/
+
+# Runtime artifacts
+session_report_*.png
+*.log
+
+# Virtual environments
+.venv/
+venv/
+
+# Editor/IDE
+.vscode/
+.idea/
