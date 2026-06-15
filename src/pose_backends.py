@@ -32,6 +32,72 @@ def _find_mmpose_root() -> Path:
         "and rerun.")
 
 
+class _HandPresenceGate:
+    """Cheap MediaPipe Hands (lite) pre-filter used to reject MMPose detections
+    that aren't actually a hand (faces, random objects), which InterNet can
+    otherwise hallucinate with moderate confidence since it has no built-in
+    hand/no-hand detector of its own."""
+
+    def __init__(self, detection_confidence: float = 0.4, pad: float = 0.35):
+        self._pad = pad
+        try:
+            import mediapipe as mp
+            self._hands = mp.solutions.hands.Hands(
+                static_image_mode=False, max_num_hands=2,
+                model_complexity=0,
+                min_detection_confidence=detection_confidence,
+                min_tracking_confidence=detection_confidence)
+        except Exception as e:
+            print(f"[pose] MediaPipe hand-presence gate disabled: {e}")
+            self._hands = None
+
+    @property
+    def enabled(self) -> bool:
+        return self._hands is not None
+
+    def hand_boxes(self, frame_bgr: np.ndarray) -> list:
+        # Returns padded (x0,y0,x1,y1) boxes for each hand MediaPipe finds in
+        # the frame, in frame_bgr pixel coordinates. Empty list = no hands.
+        h, w = frame_bgr.shape[:2]
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        results = self._hands.process(rgb)
+        boxes = []
+        if not results.multi_hand_landmarks:
+            return boxes
+        for lm in results.multi_hand_landmarks:
+            xs = [p.x * w for p in lm.landmark]
+            ys = [p.y * h for p in lm.landmark]
+            x0, x1 = min(xs), max(xs)
+            y0, y1 = min(ys), max(ys)
+            bw, bh = x1 - x0, y1 - y0
+            boxes.append((x0 - bw*self._pad, y0 - bh*self._pad,
+                           x1 + bw*self._pad, y1 + bh*self._pad))
+        return boxes
+
+    def close(self):
+        if self._hands is not None:
+            self._hands.close()
+
+
+def _center_in_box(center, box) -> bool:
+    x0, y0, x1, y1 = box
+    return x0 <= center[0] <= x1 and y0 <= center[1] <= y1
+
+
+def _filter_by_gate(hands: list, boxes: list) -> list:
+    # Keeps only detections whose keypoint centroid falls inside one of the
+    # gate's hand boxes. An empty `boxes` list (gate saw no hands) drops
+    # everything for this frame.
+    if not boxes:
+        return []
+    out = []
+    for h in hands:
+        center = h["keypoints"][:, :2].mean(0)
+        if any(_center_in_box(center, b) for b in boxes):
+            out.append(h)
+    return out
+
+
 class MMPoseHandBackend:
     DEPTH_W  = 0.4
     MAX_MISS = 12
@@ -52,6 +118,7 @@ class MMPoseHandBackend:
 
         self.score_thr   = score_thr
         self.infer_scale = infer_scale
+        self._gate       = _HandPresenceGate()
 
         self._centers = [None, None]
         self._sizes   = [None, None]
@@ -63,6 +130,9 @@ class MMPoseHandBackend:
         # Returns a list of hand dicts (up to two) with keypoints, scores, side, and palm depth.
         raw = self._run(frame_bgr)
         raw = _dedup(raw)
+
+        if self._gate.enabled:
+            raw = _filter_by_gate(raw, self._gate.hand_boxes(frame_bgr))
 
         if depth_info is not None:
             dm  = depth_info["depth_map"]
@@ -87,6 +157,9 @@ class MMPoseHandBackend:
                     self._depths[slot]  = None
 
         return [h for h in out if h is not None]
+
+    def close(self):
+        self._gate.close()
 
     def _run(self, frame_bgr: np.ndarray):
         # Scales the frame by infer_scale, runs MMPose inference, and parses results into hand dicts.

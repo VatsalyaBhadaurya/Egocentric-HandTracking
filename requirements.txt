@@ -7,9 +7,17 @@ mmpose>=1.0.0
 # Computer vision & image processing
 opencv-python>=4.8.0
 numpy>=1.24.0
+mediapipe>=0.10.0  # hand-presence gate to reject face/object false positives
 
 # Data visualization & plotting
 matplotlib>=3.7.0
+
+# Inverse kinematics (Egocentric-IK / vbhs integration)
+pybullet>=3.2.5
+scipy>=1.10.0
+
+# Optional: physical SO-101 follower arm control (--enable-robot)
+lerobot[feetech]>=0.4.1
 
 # Optional: For GPU support (uncomment if needed)
 # torch-cuda-11.8
