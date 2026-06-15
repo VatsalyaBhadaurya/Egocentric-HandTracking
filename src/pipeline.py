@@ -50,21 +50,28 @@ _MEAN_THR  = 0.18
 _JOINT_THR = 0.12
 _FRAC_THR  = 0.55
 
-CAM_W, CAM_H   = 960, 720
-PLOT_W, PLOT_H = 640, 720
+CAM_W, CAM_H   = 848, 480
+PLOT_W, PLOT_H = 640, 480
 CALIB_SECS     = 3
 
 DEPTH_MIN_M = 0.1
 DEPTH_MAX_M = 2.5
 
 
+# def _resolve_device(device: str) -> str:
+#     # Resolves "auto" (or empty) to "cuda" when a GPU is available, else "cpu".
+#     # Any other explicit value (e.g. "cpu", "cuda:1") is passed through unchanged.
+#     if device and device != "auto":
+#         return device
+#     return "cuda" if torch.cuda.is_available() else "cpu"
 def _resolve_device(device: str) -> str:
-    # Resolves "auto" (or empty) to "cuda" when a GPU is available, else "cpu".
-    # Any other explicit value (e.g. "cpu", "cuda:1") is passed through unchanged.
     if device and device != "auto":
-        return device
-    return "cuda" if torch.cuda.is_available() else "cpu"
+        resolved = device
+    else:
+        resolved = "cuda" if torch.cuda.is_available() else "cpu"
 
+    print(f"[device] using -> {resolved}  (cuda available: {torch.cuda.is_available()})")
+    return resolved
 
 class SessionStats:
     """Per-frame accumulator for session metrics; saves a PNG report on exit."""
@@ -339,6 +346,7 @@ class RobotLearningHandPipeline:
                  enable_robot=False, robot_port="", robot_id="right_follower"):
         device = _resolve_device(device)
         self.using_realsense = camera_backend == "realsense"
+        self._using_realsense = self.using_realsense
 
         if self.using_realsense:
             self.cam = RealSenseCamera(width=rs_width, height=rs_height, fps=rs_fps)
@@ -348,7 +356,9 @@ class RobotLearningHandPipeline:
             # palm-anchored calibration is required before trusting it.
             self.calib_done_default = True
         elif camera_backend == "opencv":
-            self.cam = ThreadedCamera(src=camera_index, width=CAM_W, height=CAM_H)
+            #self.cam = RealSenseCamera(width=848, height=480, fps=30)
+            #self.cam = ThreadedCamera(src=camera_index, width=CAM_W, height=CAM_H)
+            self.cam = self._init_camera(camera_index)
             self.depth = DepthEstimator(depth_model or "", device=device,
                                         encoder=da2_encoder,
                                         min_depth=DEPTH_MIN_M, max_depth=DEPTH_MAX_M)
@@ -403,7 +413,27 @@ class RobotLearningHandPipeline:
 
         self.stats = SessionStats()
         self.last_frame_state: FrameState | None = None
-
+    def _init_camera(self, camera_index: int):
+        """
+        Try RealSense first — gives real metric depth.
+        Fall back to ThreadedCamera (webcam) if RealSense not found.
+        """
+        try:
+            import pyrealsense2 as rs
+            ctx     = rs.context()
+            devices = ctx.query_devices()
+            if len(devices) == 0:
+                raise RuntimeError("No RealSense device found")
+            cam = RealSenseCamera(width=CAM_W, height=CAM_H, fps=30)
+            self._using_realsense = True
+            print("[pipeline] camera -> RealSense  (real metric depth enabled)")
+            return cam
+        except Exception as e:
+            print(f"[pipeline] RealSense not available ({e}) — falling back to webcam")
+            self._using_realsense = False
+            cam = ThreadedCamera(src=camera_index, width=CAM_W, height=CAM_H)
+            print(f"[pipeline] camera -> ThreadedCamera  src={camera_index}  (DA2 depth active)")
+            return cam
     def _tick(self):
         # Updates and returns the EMA frame rate using the elapsed time since the last call.
         now = time.time(); dt = now - self.last_t; self.last_t = now
@@ -766,15 +796,35 @@ class RobotLearningHandPipeline:
 
             vis = frame.copy()
 
-            if self.using_realsense:
-                depth_map, raw_depth = self.depth.estimate(sensor_depth)
+            if self._using_realsense:
+                # real metric depth from hardware — accurate, fast
+                depth_map = self.cam.read_depth()
+                if depth_map is None:
+                    depth_map = np.zeros((CAM_H, CAM_W), dtype=np.float32)
+                raw_depth  = depth_map
+                depth_info = {"depth_map": depth_map, "depth_est": self.depth}  # always valid
             else:
+                # fallback — DA2 neural net estimates depth from RGB
                 depth_map, raw_depth = self.depth.estimate(frame)
-            self._draw_depth_inset(vis, depth_map)
+                depth_info = {"depth_map": depth_map, "depth_est": self.depth} \
+                    if self.calib_done else None
 
-            depth_info = {"depth_map": depth_map, "depth_est": self.depth} \
-                         if self.calib_done else None
+            self._draw_depth_inset(vis, depth_map)
             hands = self.pose.infer(frame, depth_info=depth_info)
+            # if self._using_realsense:
+            #     # real metric depth from hardware — accurate, fast
+            #     depth_map = self.cam.read_depth()
+            #     if depth_map is None:
+            #         depth_map = np.zeros((CAM_H, CAM_W), dtype=np.float32)
+            #     raw_depth = depth_map
+            # else:
+            #     # fallback — DA2 neural net estimates depth from RGB
+            #     depth_map, raw_depth = self.depth.estimate(frame)          
+            # self._draw_depth_inset(vis, depth_map)
+            
+            # depth_info = {"depth_map": depth_map, "depth_est": self.depth} \
+            #              if self.calib_done else None
+            # hands = self.pose.infer(frame, depth_info=depth_info)
 
             if self.calib_active:
                 ckp, done = self._draw_calib_ui(vis, hands)
@@ -911,7 +961,6 @@ class RobotLearningHandPipeline:
 
         plt.close(self._fig)
         self.cam.release()
-        self.pose.close()
         cv2.destroyAllWindows()
         if self.ik_retargeter is not None:
             self.ik_retargeter.close()
