@@ -25,6 +25,12 @@ class ThreadedCamera:
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+        if self.cap.isOpened():
+            actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            print(f"[camera] ThreadedCamera connected  src={src}  resolution={actual_w}x{actual_h}")
+        else:
+            print(f"[camera] ThreadedCamera FAILED to open  src={src}")
 
     def read(self):
         # Reads one frame from the capture device, returning None on failure.
@@ -47,7 +53,7 @@ class RealSenseCamera:
     and aligned to the colour frame — is cached and retrieved via `read_depth()`.
     """
 
-    def __init__(self, width: int = 1280, height: int = 720, fps: int = 30):
+    def __init__(self, width: int = 848, height: int = 480, fps: int = 30):
         import pyrealsense2 as rs
         self._rs = rs
 
@@ -55,20 +61,33 @@ class RealSenseCamera:
         config = rs.config()
         config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
         config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
+        try:
+            profile = self.pipeline.start(config)
 
-        profile = self.pipeline.start(config)
-        self.depth_scale = profile.get_device().first_depth_sensor().get_depth_scale()
-        self.align = rs.align(rs.stream.color)
+            # ── connection check ──────────────────────────────────────────
+            device = profile.get_device()
+            print(f"[camera] RealSenseCamera connected  "
+                f"device={device.get_info(rs.camera_info.name)}  "
+                f"serial={device.get_info(rs.camera_info.serial_number)}  "
+                f"resolution={width}x{height}  fps={fps}")
+            # ─────────────────────────────────────────────────────────────
 
-        # Depth is aligned to the colour stream, so the colour stream's
-        # intrinsics apply to both the returned frame and its depth map.
-        color_intr = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
-        self.intrinsics = Intrinsics(
-            width=color_intr.width, height=color_intr.height,
-            fx=color_intr.fx, fy=color_intr.fy,
-            ppx=color_intr.ppx, ppy=color_intr.ppy)
+            self.depth_scale = profile.get_device().first_depth_sensor().get_depth_scale()
+            self.align       = rs.align(rs.stream.color)
 
-        self._last_depth: np.ndarray | None = None
+            color_intr = (profile.get_stream(rs.stream.color)
+                                .as_video_stream_profile()
+                                .get_intrinsics())
+            self.intrinsics = Intrinsics(
+                width=color_intr.width, height=color_intr.height,
+                fx=color_intr.fx,       fy=color_intr.fy,
+                ppx=color_intr.ppx,     ppy=color_intr.ppy)
+
+            self._last_depth: np.ndarray | None = None
+
+        except Exception as e:
+            print(f"[camera] RealSenseCamera FAILED to connect: {e}")
+            raise
 
     def read(self):
         # Reads one aligned colour+depth frame pair and returns the BGR colour
