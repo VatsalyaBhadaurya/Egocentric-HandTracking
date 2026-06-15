@@ -911,6 +911,7 @@ class RobotLearningHandPipeline:
 
         plt.close(self._fig)
         self.cam.release()
+        self.pose.close()
         cv2.destroyAllWindows()
         if self.ik_retargeter is not None:
             self.ik_retargeter.close()
