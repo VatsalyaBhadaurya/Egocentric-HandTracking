@@ -1,6 +1,3 @@
-# Author: adith
-# End-to-end real-time 3D hand tracking pipeline wiring camera, DA2 depth, InterNet pose, 1 Euro filter, and gesture abstraction
-
 import os, time, datetime
 from collections import defaultdict
 from pathlib import Path
@@ -26,7 +23,8 @@ from .gesture_abstraction import GestureAbstractor, FINGER_CHAINS_IDX, WRIST, FI
 from .one_euro_filter     import OneEuroFilter
 from .pose_backends       import MMPoseHandBackend
 from .robot_mapper        import SimpleArmRetargeter
-from .state               import FrameState
+from .state               import FrameState, is_hand_visible
+from .state               import MEAN_SCORE_THR, JOINT_SCORE_THR, VISIBLE_FRAC_THR
 from .vbhs_bridge         import hand_state_to_pose3d, to_vbhs_intrinsics
 from .ik_retargeter       import SingleArmIKRetargeter
 from .robot_driver         import SO101FollowerDriver
@@ -46,9 +44,10 @@ _GESTURE_COL_MPL = {
     "PINCH":     "#00C8C8",
 }
 
-_MEAN_THR  = 0.18
-_JOINT_THR = 0.12
-_FRAC_THR  = 0.55
+# Shared with HandState.visible so the overlay and the IK/robot gate agree.
+_MEAN_THR  = MEAN_SCORE_THR
+_JOINT_THR = JOINT_SCORE_THR
+_FRAC_THR  = VISIBLE_FRAC_THR
 
 CAM_W, CAM_H   = 848, 480
 PLOT_W, PLOT_H = 640, 480
@@ -70,7 +69,7 @@ def _resolve_device(device: str) -> str:
     else:
         resolved = "cuda" if torch.cuda.is_available() else "cpu"
 
-    print(f"[device] using -> {resolved}  (cuda available: {torch.cuda.is_available()})")
+    print(f"[device] using → {resolved}  (cuda available: {torch.cuda.is_available()})")
     return resolved
 
 class SessionStats:
@@ -346,7 +345,6 @@ class RobotLearningHandPipeline:
                  enable_robot=False, robot_port="", robot_id="right_follower"):
         device = _resolve_device(device)
         self.using_realsense = camera_backend == "realsense"
-        self._using_realsense = self.using_realsense
 
         if self.using_realsense:
             self.cam = RealSenseCamera(width=rs_width, height=rs_height, fps=rs_fps)
@@ -425,14 +423,14 @@ class RobotLearningHandPipeline:
             if len(devices) == 0:
                 raise RuntimeError("No RealSense device found")
             cam = RealSenseCamera(width=CAM_W, height=CAM_H, fps=30)
-            self._using_realsense = True
-            print("[pipeline] camera -> RealSense  (real metric depth enabled)")
+            self.using_realsense = True
+            print("[pipeline] camera → RealSense  (real metric depth enabled)")
             return cam
         except Exception as e:
             print(f"[pipeline] RealSense not available ({e}) — falling back to webcam")
-            self._using_realsense = False
+            self.using_realsense = False
             cam = ThreadedCamera(src=camera_index, width=CAM_W, height=CAM_H)
-            print(f"[pipeline] camera -> ThreadedCamera  src={camera_index}  (DA2 depth active)")
+            print(f"[pipeline] camera → ThreadedCamera  src={camera_index}  (DA2 depth active)")
             return cam
     def _tick(self):
         # Updates and returns the EMA frame rate using the elapsed time since the last call.
@@ -443,8 +441,7 @@ class RobotLearningHandPipeline:
 
     def _visible(self, sc):
         # Returns True if the mean score and the fraction of joints above threshold both exceed their minimums.
-        return (float(np.mean(sc)) >= _MEAN_THR and
-                float(np.mean(sc > _JOINT_THR)) >= _FRAC_THR)
+        return is_hand_visible(sc)
 
     def _draw_skeleton(self, frame, kp2d, sc):
         # Draws the five finger chains in distinct colours and a grey palm polyline on the frame.
@@ -796,7 +793,7 @@ class RobotLearningHandPipeline:
 
             vis = frame.copy()
 
-            if self._using_realsense:
+            if self.using_realsense:
                 # real metric depth from hardware — accurate, fast
                 depth_map = self.cam.read_depth()
                 if depth_map is None:
@@ -811,7 +808,7 @@ class RobotLearningHandPipeline:
 
             self._draw_depth_inset(vis, depth_map)
             hands = self.pose.infer(frame, depth_info=depth_info)
-            # if self._using_realsense:
+            # if self.using_realsense:
             #     # real metric depth from hardware — accurate, fast
             #     depth_map = self.cam.read_depth()
             #     if depth_map is None:
@@ -919,12 +916,16 @@ class RobotLearningHandPipeline:
                         right_hand.keypoints, right_hand.scores,
                         depth_map, to_vbhs_intrinsics(self.cam.intrinsics),
                         joint_thr=self.score_thr)
-                    ik_result = self.ik_retargeter.step(pose3d)
+                    ik_result = self.ik_retargeter.step(pose3d, fps=fps_now)
                     self._draw_ik_solution(vis, right_hand, ik_result)
 
                     if (self.enable_robot and self._robot_armed
                             and ik_result.joint_angles is not None):
                         self.robot_driver.send(ik_result.joint_angles)
+                else:
+                    # No right hand this frame — clear smoothing state so the
+                    # arm doesn't lerp across the tracking gap on re-acquisition.
+                    self.ik_retargeter.reset()
 
             self._draw_session_overlay(vis)
 

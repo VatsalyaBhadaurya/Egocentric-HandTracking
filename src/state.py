@@ -9,6 +9,26 @@ if TYPE_CHECKING:
     from .robot_mapper import ArmCommand
 
 
+# Hand-visibility thresholds — the single source of truth shared by the live
+# overlay and HandState.visible (which gates the IK/robot path). A detection is
+# only "visible" if its mean confidence clears MEAN_SCORE_THR *and* enough of
+# its joints individually clear JOINT_SCORE_THR. The two-part test rejects the
+# low-confidence phantom poses the detector-less top-down model emits when no
+# real hand is in frame.
+MEAN_SCORE_THR = 0.18
+JOINT_SCORE_THR = 0.12
+VISIBLE_FRAC_THR = 0.55
+
+
+def is_hand_visible(scores: np.ndarray) -> bool:
+    """True when a hand's keypoint scores indicate a real detection, not a
+    spurious top-down pose. Mirrors the live-overlay acceptance gate."""
+    if not getattr(scores, "size", 0):
+        return False
+    return (float(np.mean(scores)) >= MEAN_SCORE_THR and
+            float(np.mean(scores > JOINT_SCORE_THR)) >= VISIBLE_FRAC_THR)
+
+
 @dataclass(eq=False)
 class HandState:
     slot: int
@@ -32,7 +52,7 @@ class HandState:
 
     @property
     def visible(self) -> bool:
-        return bool(self.scores.size and float(np.mean(self.scores)) > 0.0)
+        return is_hand_visible(self.scores)
 
 
 @dataclass(eq=False)
