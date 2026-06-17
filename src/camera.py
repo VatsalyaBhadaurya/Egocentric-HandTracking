@@ -1,6 +1,3 @@
-# Author: adith
-# OpenCV VideoCapture wrapper that always returns the latest frame
-
 from dataclasses import dataclass
 
 import cv2
