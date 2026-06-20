@@ -1,6 +1,5 @@
-# Drives a physical LeRobot SO-101 follower arm (right arm) from the joint
-# angles produced by SingleArmIKRetargeter, using the same joint ranges and
-# normalization as vbhs/src/vbhs/scripts/action_playback.py.
+# Drives a physical LeRobot SO-101 follower arm (right arm) from joint angles
+# produced by the ikpy-based SO101IKSolver in launch.py.
 
 from __future__ import annotations
 
@@ -8,8 +7,7 @@ import time
 
 import numpy as np
 
-# [j1..j5, gripper] joint limits in radians, matching action_playback.py's
-# JOINT_RANGES_RADS / Dual_S101_Assembly.urdf.
+# [j1..j5, gripper] joint limits in radians, matching SO-101 URDF limits.
 JOINT_RANGES_RADS = np.array([
     [-1.91986, 1.91986],
     [-1.74533, 1.74533],
@@ -34,9 +32,7 @@ STANDBY_ACTION = {
 
 
 def joint_angles_to_action(joint_angles_rad) -> dict[str, float]:
-    """Converts [j1..j5, gripper] radians (vbhs IK convention) into a LeRobot
-    SO-101 send_action dict, normalized the same way as
-    vbhs.scripts.action_playback.prepare_action."""
+    """Converts [j1..j5, gripper] radians into a LeRobot SO-101 send_action dict."""
     angles = np.clip(np.asarray(joint_angles_rad, dtype=np.float64),
                       JOINT_RANGES_RADS[:, 0], JOINT_RANGES_RADS[:, 1])
     normalized = (angles - JOINT_RANGES_RADS[:, 0]) / (JOINT_RANGES_RADS[:, 1] - JOINT_RANGES_RADS[:, 0])
