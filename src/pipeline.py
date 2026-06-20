@@ -1,5 +1,5 @@
 import os, time, datetime
-from collections import defaultdict
+from collections import defaultdict, deque
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_FONTDIR", "/usr/share/fonts/truetype/dejavu")
@@ -16,7 +16,7 @@ try:
 except ImportError:
     pass
 
-from .camera              import ThreadedCamera, RealSenseCamera
+from .camera              import ThreadedCamera, RealSenseCamera, OrbbecCamera
 from .action_encoder      import HandActionEncoder, build_hand_state
 from .depth_estimator     import DepthEstimator, RealSenseDepthEstimator
 from .gesture_abstraction import GestureAbstractor, FINGER_CHAINS_IDX, WRIST, FINGER_TIPS
@@ -25,9 +25,6 @@ from .pose_backends       import MMPoseHandBackend
 from .robot_mapper        import SimpleArmRetargeter
 from .state               import FrameState, is_hand_visible
 from .state               import MEAN_SCORE_THR, JOINT_SCORE_THR, VISIBLE_FRAC_THR
-from .vbhs_bridge         import hand_state_to_pose3d, to_vbhs_intrinsics
-from .ik_retargeter       import SingleArmIKRetargeter
-from .robot_driver         import SO101FollowerDriver
 
 _BGR = [(203,192,255), (50,100,255), (50,205,50), (0,165,255), (147,112,219)]
 _RGB = [(r/255, g/255, b/255) for (b, g, r) in _BGR]
@@ -340,19 +337,29 @@ class RobotLearningHandPipeline:
                  depth_model="", da2_encoder="vitl", infer_scale=0.6,
                  report_dir=".", camera_index=0,
                  camera_backend="opencv",
-                 rs_width=1280, rs_height=720, rs_fps=30,
-                 enable_ik=False,
-                 enable_robot=False, robot_port="", robot_id="right_follower"):
+                 rs_width=1280, rs_height=720, rs_fps=30):
         device = _resolve_device(device)
         self.using_realsense = camera_backend == "realsense"
-
-        if self.using_realsense:
-            self.cam = RealSenseCamera(width=rs_width, height=rs_height, fps=rs_fps)
+        self.using_orbbec = camera_backend == "orbbec"
+        if self.using_realsense or self.using_orbbec:
+            if self.using_realsense:
+                self.cam = RealSenseCamera(width=rs_width, height=rs_height, fps=rs_fps)
+                self.depth_label = "RS"
+            else:
+                self.cam = OrbbecCamera(width=rs_width, height=rs_height, fps=rs_fps)
+                self.depth_label = "OB"
+            
             self.depth = RealSenseDepthEstimator(min_depth=DEPTH_MIN_M, max_depth=DEPTH_MAX_M)
-            self.depth_label = "RS"
-            # The D415 reports real metric depth from the first frame — no
-            # palm-anchored calibration is required before trusting it.
+            # The hardware reports real metric depth from the first frame
             self.calib_done_default = True
+
+        # if self.using_realsense:
+        #     self.cam = RealSenseCamera(width=rs_width, height=rs_height, fps=rs_fps)
+        #     self.depth = RealSenseDepthEstimator(min_depth=DEPTH_MIN_M, max_depth=DEPTH_MAX_M)
+        #     self.depth_label = "RS"
+        #     # The D415 reports real metric depth from the first frame — no
+        #     # palm-anchored calibration is required before trusting it.
+        #     self.calib_done_default = True
         elif camera_backend == "opencv":
             #self.cam = RealSenseCamera(width=848, height=480, fps=30)
             #self.cam = ThreadedCamera(src=camera_index, width=CAM_W, height=CAM_H)
@@ -376,32 +383,28 @@ class RobotLearningHandPipeline:
         self.gestures = [GestureAbstractor(history=5),
                          GestureAbstractor(history=5)]
         self.actions  = HandActionEncoder()
-        self.retargeter = SimpleArmRetargeter(image_size=(CAM_W, CAM_H))
-
-        # Single-arm (right hand -> SO-101 right arm) IK retargeting via the
-        # vendored vbhs pipeline. Needs real camera intrinsics, so only
-        # available on the RealSense backend.
-        self.enable_ik = bool(enable_ik) and self.using_realsense
-        self.ik_retargeter = SingleArmIKRetargeter(gui=False) if self.enable_ik else None
-
-        # Drives a physical LeRobot SO-101 follower arm from the IK solution
-        # above. Requires --enable-ik and a serial port for the arm; if the
-        # connection fails, the pipeline keeps running with the robot disabled.
-        self.robot_driver = None
-        # Starts disarmed (holding standby) until the user presses 'g'; press
-        # 's' at any time to send standby and disarm again.
-        self._robot_armed = False
-        self.enable_robot = bool(enable_robot) and self.enable_ik and bool(robot_port)
-        if self.enable_robot:
-            try:
-                self.robot_driver = SO101FollowerDriver(port=robot_port, robot_id=robot_id)
-            except Exception as e:
-                print(f"[robot] Failed to connect to SO-101 follower on {robot_port!r}: {e}")
-                self.enable_robot = False
-
+        #self.retargeter = SimpleArmRetargeter(image_size=(CAM_W, CAM_H))
+        intr = getattr(self.cam, "intrinsics", None)
+        using_hw_depth = self.using_realsense or self.using_orbbec
+        self.retargeter = SimpleArmRetargeter(
+                    intr,
+                    image_size=(CAM_W, CAM_H),
+                    home_xyz=(0.20, 0.0, 0.20),   # set to your arm's comfortable resting pose (metres)
+                    scale=1.0,                    # robot metres per hand metre
+                    # Webcam DA2 depth is unreliable → freeze forward axis.
+                    # RealSense/Orbbec give true metric depth → use it.
+                    freeze_depth_axis=not using_hw_depth,
+                )
         self._fig = plt.figure(figsize=(PLOT_W/100, PLOT_H/100),
                                dpi=100, facecolor="white")
         self._ax  = self._fig.add_subplot(111, projection="3d")
+
+        # Dedicated, separately-windowed 3D point view (see _render_3d_points).
+        # A second figure so it doesn't clobber the composited side panel.
+        self._fig3d = plt.figure(figsize=(PLOT_W/100, PLOT_H/100),
+                                 dpi=100, facecolor="white")
+        self._ax3d  = self._fig3d.add_subplot(111, projection="3d")
+        self._xyz_trail = deque(maxlen=60)   # recent IK target points for the trail
 
         self.last_t       = time.time()
         self.fps          = 0.0
@@ -411,27 +414,22 @@ class RobotLearningHandPipeline:
 
         self.stats = SessionStats()
         self.last_frame_state: FrameState | None = None
+
+        # Guards _cleanup() so the run-loop exit and the launcher's finally block
+        # don't double-release the camera.
+        self._cleaned_up = False
+
     def _init_camera(self, camera_index: int):
+        """Open the webcam requested via --camera-backend opencv.
+
+        No probing/fallback: the user chose the backend, so we honour it directly.
         """
-        Try RealSense first — gives real metric depth.
-        Fall back to ThreadedCamera (webcam) if RealSense not found.
-        """
-        try:
-            import pyrealsense2 as rs
-            ctx     = rs.context()
-            devices = ctx.query_devices()
-            if len(devices) == 0:
-                raise RuntimeError("No RealSense device found")
-            cam = RealSenseCamera(width=CAM_W, height=CAM_H, fps=30)
-            self.using_realsense = True
-            print("[pipeline] camera → RealSense  (real metric depth enabled)")
-            return cam
-        except Exception as e:
-            print(f"[pipeline] RealSense not available ({e}) — falling back to webcam")
-            self.using_realsense = False
-            cam = ThreadedCamera(src=camera_index, width=CAM_W, height=CAM_H)
-            print(f"[pipeline] camera → ThreadedCamera  src={camera_index}  (DA2 depth active)")
-            return cam
+        cam = ThreadedCamera(src=camera_index, width=CAM_W, height=CAM_H)
+        if not cam.opened:
+            print(f"[pipeline] camera_index={camera_index} did not open — "
+                  f"check `ls /dev/video*` and pass a working --camera-index")
+        print(f"[pipeline] camera → ThreadedCamera  src={camera_index}  (DA2 depth active)")
+        return cam
     def _tick(self):
         # Updates and returns the EMA frame rate using the elapsed time since the last call.
         now = time.time(); dt = now - self.last_t; self.last_t = now
@@ -657,9 +655,6 @@ class RobotLearningHandPipeline:
                     f"FPS:{self.fps:.1f}  Hands:{n}  {self.depth_label}/{cal}",
                     (12,H-8),cv2.FONT_HERSHEY_SIMPLEX,0.44,(160,160,160),1)
         hint = "c=calibrate  r=reset  ESC=quit"
-        if self.enable_robot:
-            armed = "ARMED" if self._robot_armed else "STANDBY"
-            hint += f"  g=arm  s=standby  [{armed}]"
         cv2.putText(frame, hint,
                     (W-360,H-8),cv2.FONT_HERSHEY_SIMPLEX,0.36,(120,120,120),1)
 
@@ -692,28 +687,6 @@ class RobotLearningHandPipeline:
         ty = int(np.clip(cy + 34, 12, H - 4))
         cv2.putText(frame, txt, (tx, ty),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.36, (0, 255, 255), 1, cv2.LINE_AA)
-
-    def _draw_ik_solution(self, frame, hand_state, result):
-        # Shows the SO-101 right-arm joint angles (degrees) solved by the
-        # vbhs PyBullet IK solver for the tracked right hand, or a "no
-        # solution" notice when the target was unreachable/rejected.
-        H, W = frame.shape[:2]
-        cx, cy = hand_state.palm_center_2d
-        cx, cy = int(round(float(cx))), int(round(float(cy)))
-        tx = int(np.clip(cx - 110, 2, W - 330))
-        ty = int(np.clip(cy + 50, 12, H - 4))
-
-        if result.joint_angles is None:
-            cv2.putText(frame, "SO-101: no IK solution", (tx, ty),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.36, (0, 140, 255), 1, cv2.LINE_AA)
-            return
-
-        deg = np.degrees(result.joint_angles)
-        txt = ("SO-101 j1-6deg "
-               f"{deg[0]:+.0f} {deg[1]:+.0f} {deg[2]:+.0f} "
-               f"{deg[3]:+.0f} {deg[4]:+.0f} {deg[5]:+.0f}")
-        cv2.putText(frame, txt, (tx, ty),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, (255, 200, 0), 1, cv2.LINE_AA)
 
     def _render_3d(self, hands_data, title):
         # Renders the current hand skeletons onto a Matplotlib 3D axes and returns a BGR numpy image.
@@ -768,20 +741,112 @@ class RobotLearningHandPipeline:
         buf=buf.reshape(self._fig.canvas.get_width_height()[::-1]+(4,))
         return cv2.cvtColor(cv2.resize(buf,(PLOT_W,PLOT_H)),cv2.COLOR_RGBA2BGR)
 
-    def run(self):
+    def _render_3d_points(self, arm_commands, azim):
+        # Dedicated window showing the SINGLE metric IK target point that the
+        # retargeter (robot_mapper.SimpleArmRetargeter.map) computes and hands to
+        # the IK solver — arm_cmd.target_xyz, in metres, robot base frame.
+        # Fixed axis limits (home +/- max_reach) so you read absolute position;
+        # the azimuth rotates so depth is perceivable; a faint trail shows motion.
+        # Use it to check the 3D-pose -> 3D-point generation is correct.
+        ax = self._ax3d; ax.cla()
+        ax.set_facecolor("white")
+        for pane in [ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane]:
+            pane.fill = False; pane.set_edgecolor("#cccccc")
+        ax.grid(True, color="#e0e0e0", linewidth=0.3)
+        ax.tick_params(labelsize=5)
+        ax.view_init(elev=18, azim=azim)
+
+        home  = np.asarray(self.retargeter.home_xyz, dtype=float)
+        reach = float(self.retargeter.max_reach)
+        ax.set_xlim(home[0] - reach, home[0] + reach)
+        ax.set_ylim(home[1] - reach, home[1] + reach)
+        ax.set_zlim(home[2] - reach, home[2] + reach)
+
+        # Home pose as a static reference (arm rests here => target == home).
+        ax.scatter([home[0]], [home[1]], [home[2]], c="#bbbbbb", s=40,
+                   marker="o", depthshade=False, label="home")
+
+        target = None
+        for ac in (arm_commands or []):
+            target = np.asarray(ac.target_xyz, dtype=float)
+            break
+
+        if target is not None:
+            self._xyz_trail.append(target.copy())
+            if len(self._xyz_trail) > 1:
+                tr = np.asarray(self._xyz_trail)
+                ax.plot(tr[:, 0], tr[:, 1], tr[:, 2], color="crimson",
+                        linewidth=1.0, alpha=0.35)
+            # The single IK target point.
+            ax.scatter([target[0]], [target[1]], [target[2]], c="crimson",
+                       s=120, marker="o", depthshade=False,
+                       edgecolors="black", linewidths=0.6, zorder=6)
+            ax.text2D(0.02, 0.02,
+                      f"IK xyz (m): {target[0]:+.3f} {target[1]:+.3f} {target[2]:+.3f}",
+                      transform=ax.transAxes, fontsize=8, color="black")
+        else:
+            self._xyz_trail.clear()
+            ax.text2D(0.02, 0.02, "no hand -> target = home",
+                      transform=ax.transAxes, fontsize=8, color="#888888")
+
+        ax.set_title("IK target point", fontsize=9, pad=2)
+        ax.set_xlabel("X (m)", fontsize=7, labelpad=1)
+        ax.set_ylabel("Y (m)", fontsize=7, labelpad=1)
+        ax.set_zlabel("Z (m)", fontsize=7, labelpad=1)
+
+        self._fig3d.canvas.draw()
+        buf = np.frombuffer(self._fig3d.canvas.buffer_rgba(), dtype=np.uint8)
+        buf = buf.reshape(self._fig3d.canvas.get_width_height()[::-1] + (4,))
+        return cv2.cvtColor(cv2.resize(buf, (PLOT_W, PLOT_H)), cv2.COLOR_RGBA2BGR)
+
+    def run(self, stop_event=None):
         # Main loop: capture frame, run DA2 depth and InterNet pose, apply 1 Euro smoothing and gesture
-        # Cclassification, draw all overlays, and composite the 3D preview panel beside the camera feed.
+        # classification, draw all overlays, and composite the 3D preview panel beside the camera feed.
+        # stop_event (threading.Event) lets the launcher request a clean shutdown
+        # from its signal handler; the loop also exits on ESC.
         blank = self._render_3d([], "Prediction (0)")
 
+        print(f"[run] entering main loop  cam={type(self.cam).__name__}  "
+              f"realsense={self.using_realsense}  orbbec={self.using_orbbec}")
+
+        loop_i        = 0
+        none_streak   = 0
+        first_frame   = True
+
         while True:
+            if stop_event is not None and stop_event.is_set():
+                print("[run] stop requested — exiting main loop")
+                break
+            loop_i += 1
             fps_now = self._tick()
             frame_t = time.time()
 
             frame = self.cam.read()
             if frame is None:
+                none_streak += 1
+                # Rate-limited so a permanently-dead camera doesn't spam, but we
+                # still see immediately that read() is returning None.
+                if none_streak == 1 or none_streak % 60 == 0:
+                    print(f"[run] cam.read() returned None  "
+                          f"(streak={none_streak}, loop={loop_i}) — "
+                          f"skipping frame; UI window will NOT open until a "
+                          f"frame arrives")
                 continue
 
-            sensor_depth = self.cam.read_depth() if self.using_realsense else None
+            if none_streak:
+                print(f"[run] cam.read() recovered after {none_streak} "
+                      f"None frame(s)")
+                none_streak = 0
+
+            if first_frame:
+                print(f"[run] first frame OK  shape={frame.shape}  "
+                      f"dtype={frame.dtype}")
+                first_frame = False
+            t_start_inf = time.time()
+            using_hw = self.using_realsense or self.using_orbbec
+            sensor_depth = self.cam.read_depth() if using_hw else None
+            # For RealSense only: skip frame if hardware depth is unavailable.
+            # For Orbbec: proceed with a zero fallback so the UI still renders.
             if self.using_realsense and sensor_depth is None:
                 continue
 
@@ -793,9 +858,9 @@ class RobotLearningHandPipeline:
 
             vis = frame.copy()
 
-            if self.using_realsense:
+            if using_hw:
                 # real metric depth from hardware — accurate, fast
-                depth_map = self.cam.read_depth()
+                depth_map = sensor_depth if sensor_depth is not None else self.cam.read_depth()
                 if depth_map is None:
                     depth_map = np.zeros((CAM_H, CAM_W), dtype=np.float32)
                 raw_depth  = depth_map
@@ -805,9 +870,12 @@ class RobotLearningHandPipeline:
                 depth_map, raw_depth = self.depth.estimate(frame)
                 depth_info = {"depth_map": depth_map, "depth_est": self.depth} \
                     if self.calib_done else None
-
+            t_depth_done = time.time()
             self._draw_depth_inset(vis, depth_map)
             hands = self.pose.infer(frame, depth_info=depth_info)
+            t_pose_done = time.time()
+            if loop_i < 5 or loop_i % 30 == 0:
+                print(f"[run debug] Loop {loop_i} | Depth Eval: {t_depth_done - t_start_inf:.2f}s | Pose Eval: {t_pose_done - t_depth_done:.2f}s")
             # if self.using_realsense:
             #     # real metric depth from hardware — accurate, fast
             #     depth_map = self.cam.read_depth()
@@ -907,26 +975,6 @@ class RobotLearningHandPipeline:
                 if hand_state.visible:
                     self._draw_ik_target(vis, hand_state, arm_cmd)
 
-            if self.ik_retargeter is not None:
-                right_hand = next(
-                    (hs for hs in hand_states if hs.visible and hs.side == "right"),
-                    next((hs for hs in hand_states if hs.visible and hs.slot == 0), None))
-                if right_hand is not None:
-                    pose3d = hand_state_to_pose3d(
-                        right_hand.keypoints, right_hand.scores,
-                        depth_map, to_vbhs_intrinsics(self.cam.intrinsics),
-                        joint_thr=self.score_thr)
-                    ik_result = self.ik_retargeter.step(pose3d, fps=fps_now)
-                    self._draw_ik_solution(vis, right_hand, ik_result)
-
-                    if (self.enable_robot and self._robot_armed
-                            and ik_result.joint_angles is not None):
-                        self.robot_driver.send(ik_result.joint_angles)
-                else:
-                    # No right hand this frame — clear smoothing state so the
-                    # arm doesn't lerp across the tracking gap on re-acquisition.
-                    self.ik_retargeter.reset()
-
             self._draw_session_overlay(vis)
 
             self._draw_legend(vis)
@@ -940,6 +988,18 @@ class RobotLearningHandPipeline:
             canvas[:plot.shape[0],CAM_W:CAM_W+plot.shape[1]] = plot
 
             cv2.imshow("Robot Learning Hand Pipeline", canvas)
+
+            # Separate window showing the single metric IK target point
+            # (arm_cmd.target_xyz) so you can verify 3D-point generation.
+            # Fixed azim (rotation off). For a spinning view use (loop_i * 2) % 360.
+            points3d = self._render_3d_points(arm_commands, azim=-60)
+            cv2.imshow("IK Target Point", points3d)
+            if loop_i == 1 or (not hasattr(self, "_imshow_logged")):
+                print(f"[run] cv2.imshow called  canvas={canvas.shape}  "
+                      f"hands={len(hands)}  fps={self.fps:.1f}  "
+                      f"(if no window appears, it's a GUI/Qt backend issue, "
+                      f"not the camera)")
+                self._imshow_logged = True
             key = cv2.waitKey(1) & 0xFF
             if key == 27:
                 break
@@ -947,23 +1007,43 @@ class RobotLearningHandPipeline:
                 self.calib_active = True
                 self.calib_start  = time.time()
                 self.depth.begin_calibration()
-            elif key == ord('g') and self.enable_robot:
-                self._robot_armed = True
-            elif key == ord('s') and self.enable_robot:
-                self._robot_armed = False
-                self.robot_driver.send_standby()
             elif key == ord('r'):
                 self.depth.fusion.reset()
                 self.calib_done   = self.calib_done_default
                 self.calib_active = False
                 self.pose._depths = [None, None]
+            
+            #time.sleep(0.005)
+        self._cleanup()
 
-        self.stats.save_report(out_dir=self.report_dir)
+    def _cleanup(self):
+        # Idempotent — safe to call from both the run loop and the launcher's
+        # finally block. Releasing the camera here is what lets ROS shut down
+        # instead of waiting on a still-open capture device.
+        if self._cleaned_up:
+            return
+        self._cleaned_up = True
 
-        plt.close(self._fig)
-        self.cam.release()
-        cv2.destroyAllWindows()
-        if self.ik_retargeter is not None:
-            self.ik_retargeter.close()
-        if self.robot_driver is not None:
-            self.robot_driver.close()
+        print("[cleanup] shutting down pipeline ...")
+        try:
+            self.stats.save_report(out_dir=self.report_dir)
+        except Exception:
+            pass
+        try:
+            plt.close(self._fig)
+        except Exception:
+            pass
+        try:
+            print("[cleanup] releasing camera ...")
+            self.cam.release()
+            print("[cleanup] camera released")
+        except Exception as e:
+            print(f"[cleanup] camera release error: {e}")
+        try:
+            cv2.destroyAllWindows()
+            # On some backends destroyAllWindows needs a waitKey to actually
+            # tear the window down.
+            cv2.waitKey(1)
+        except Exception:
+            pass
+        print("[cleanup] done")
