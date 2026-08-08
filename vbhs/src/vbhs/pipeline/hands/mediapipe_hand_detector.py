@@ -66,32 +66,36 @@ class MediaPipeHandDetector(hand_detector.HandDetector):
 
     def detect(
             self, rgb_image: cv2.typing.MatLike
-            ) -> tuple[Optional[types.HandPose2D], Optional[types.HandPose2D]]:
+            ) -> tuple[Optional[types.HandPose2D], Optional[types.HandPose2D],
+                       Optional[types.HandPose3D], Optional[types.HandPose3D]]:
         """Detect hand landmarks from an RGB image.
 
-        Returns ``(left_hand, right_hand)`` in FPV convention. A hand is returned
-        whenever MediaPipe locates it, regardless of whether the palm or the back
-        of the hand faces the camera. When the dorsal view makes the left/right
-        label unreliable, the detection is assigned to the arm it occupied on the
-        previous frame so tracking stays seamless instead of dropping out.
+        Returns ``(left_2d, right_2d, left_world, right_world)`` in FPV convention.
+        A hand is returned whenever MediaPipe locates it, regardless of whether the
+        palm or the back of the hand faces the camera. When the dorsal view makes
+        the left/right label unreliable, the detection is assigned to the arm it
+        occupied on the previous frame so tracking stays seamless instead of
+        dropping out.
+
+        World landmarks are from MediaPipe's ``hand_world_landmarks``: metric 3D
+        in a hand-centric frame (origin at the geometric centre of the hand).
+        These are more stable for inter-joint distances and relative orientation
+        than the depth-deprojected camera-space positions, especially at fingertips.
         """
-        # Extract image dimensions from the input image
         image_height, image_width = rgb_image.shape[:2]
 
         results = self._hands.process(rgb_image)
 
         if not results.multi_hand_landmarks or not results.multi_handedness:
-            # Nothing in view: forget stale slot history so the next acquisition
-            # starts clean rather than snapping to an old centroid.
             self._prev_centroids = {}
-            return None, None
+            return None, None, None, None
+
+        world_lms_list = results.multi_hand_world_landmarks or []
 
         # ── 1. Collect every detected hand without dropping ambiguous ones ──────
-        # We keep a hand even when its handedness score is low: a back-of-hand
-        # view is a real hand that MediaPipe simply can't label confidently.
-        detections = []  # list of dicts: label, score, landmarks, centroid
-        for hand_landmarks, handedness in zip(results.multi_hand_landmarks,
-                                              results.multi_handedness):
+        detections = []
+        for i, (hand_landmarks, handedness) in enumerate(
+                zip(results.multi_hand_landmarks, results.multi_handedness)):
             hand_label = handedness.classification[0].label  # "Left" or "Right"
             confidence = handedness.classification[0].score
 
@@ -106,28 +110,41 @@ class MediaPipeHandDetector(hand_detector.HandDetector):
             landmarks_uv: types.HandPose2D = {}
             sum_u = sum_v = 0.0
             for key, index in config.MEDIAPIPE_HAND_LANDMARKS.items():
-                landmark = hand_landmarks.landmark[index]
-                u = landmark.x * image_width
-                v = landmark.y * image_height
+                lm = hand_landmarks.landmark[index]
+                u = lm.x * image_width
+                v = lm.y * image_height
                 landmarks_uv[key] = (u, v)
                 sum_u += u
                 sum_v += v
             n = len(landmarks_uv)
             centroid = (sum_u / n, sum_v / n)
 
+            # Extract metric world landmarks when available (same index as 2D list).
+            world_landmarks_xyz: Optional[types.HandPose3D] = None
+            if i < len(world_lms_list):
+                wlms = world_lms_list[i]
+                world_landmarks_xyz = {
+                    key: (wlms.landmark[idx].x,
+                          wlms.landmark[idx].y,
+                          wlms.landmark[idx].z)
+                    for key, idx in config.MEDIAPIPE_HAND_LANDMARKS.items()
+                }
+
             detections.append({
                 'label': hand_label,
                 'score': confidence,
                 'landmarks': landmarks_uv,
+                'world_landmarks': world_landmarks_xyz,
                 'centroid': centroid,
             })
 
         if not detections:
             self._prev_centroids = {}
-            return None, None
+            return None, None, None, None
 
         # ── 2. Assign detections to FPV left/right slots ────────────────────────
         slots: dict[str, types.HandPose2D] = {}
+        world_slots: dict[str, Optional[types.HandPose3D]] = {}
 
         def fpv_side(label: str) -> str:
             # MediaPipe labels are from the imaged person's perspective, mirrored
@@ -137,31 +154,33 @@ class MediaPipeHandDetector(hand_detector.HandDetector):
         ambiguous = (len(detections) == 1
                      and detections[0]['score'] < self._reliable_handedness)
         if ambiguous and self._prev_centroids:
-            # Single hand whose left/right label can't be trusted (the dorsal
-            # case): keep it on whichever arm it was closest to last frame so the
-            # hand doesn't vanish or jump arms when it rotates.
             d = detections[0]
             side = min(
                 self._prev_centroids,
                 key=lambda s: _sq_dist(d['centroid'], self._prev_centroids[s]))
             slots[side] = d['landmarks']
+            world_slots[side] = d['world_landmarks']
         else:
             for d in detections:
                 side = fpv_side(d['label'])
                 if side in slots:
-                    # Both hands got the same label (can happen on dorsal views);
-                    # place the duplicate in the remaining free slot.
                     side = 'left' if 'left' not in slots else 'right'
                     if side in slots:
                         continue
                 slots[side] = d['landmarks']
+                world_slots[side] = d['world_landmarks']
 
         # ── 3. Refresh slot-history centroids for next-frame continuity ─────────
         self._prev_centroids = {
             side: _centroid_of(lm) for side, lm in slots.items()
         }
 
-        return slots.get('left'), slots.get('right')
+        return (
+            slots.get('left'),
+            slots.get('right'),
+            world_slots.get('left'),
+            world_slots.get('right'),
+        )
 
     def cleanup(self):
         """Cleanup MediaPipe resources."""

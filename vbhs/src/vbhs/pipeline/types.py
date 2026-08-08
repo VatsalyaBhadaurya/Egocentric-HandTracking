@@ -62,6 +62,10 @@ class HandLandmarksImageSpace:
     """2D hand landmark positions in image-space coordinates (u, v)."""
     left_hand_landmarks: Optional[HandPose2D]  # 21 landmarks (u, v) or None
     right_hand_landmarks: Optional[HandPose2D]  # 21 landmarks (u, v) or None
+    # World landmarks from MediaPipe: metric 3D in hand-centric frame.
+    # None when using WiLoR or when MediaPipe world landmarks are unavailable.
+    left_world_landmarks: Optional[HandPose3D] = None
+    right_world_landmarks: Optional[HandPose3D] = None
 
 
 @dataclasses.dataclass

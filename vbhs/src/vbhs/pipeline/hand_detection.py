@@ -78,23 +78,28 @@ class HandLandmarksFromCameraFrame(
         # Convert BGR to RGB for MediaPipe (RealSense provides BGR format).
         rgb_image = cv2.cvtColor(camera_frame.rgb, cv2.COLOR_BGR2RGB)  # pylint: disable=no-member
 
-        # Extract hand landmarks.
-        left_hand_landmarks, right_hand_landmarks = self._hand_detector.detect(rgb_image)
+        # Extract hand landmarks. World landmarks are metric 3D in hand-centric
+        # frame (MediaPipe only); None when using WiLoR.
+        left_hand_landmarks, right_hand_landmarks, left_world, right_world = (
+            self._hand_detector.detect(rgb_image))
 
         if self._enable_smoothing:
-            # Apply EMA smoothing
+            # Apply EMA smoothing to 2D landmarks only; world landmarks are
+            # already scale-normalised and stable, so no smoothing needed.
             left_hand_landmarks = self._smooth_landmarks(
                 left_hand_landmarks, self._smoothed_left_hand_landmarks)
             right_hand_landmarks = self._smooth_landmarks(
                 right_hand_landmarks, self._smoothed_right_hand_landmarks)
 
-            # Update the stored smoothed landmarks for the next frame
             self._smoothed_left_hand_landmarks = left_hand_landmarks
             self._smoothed_right_hand_landmarks = right_hand_landmarks
 
         return types.HandLandmarksImageSpace(
             left_hand_landmarks=left_hand_landmarks,
-            right_hand_landmarks=right_hand_landmarks)
+            right_hand_landmarks=right_hand_landmarks,
+            left_world_landmarks=left_world,
+            right_world_landmarks=right_world,
+        )
 
     def _smooth_landmarks(
             self,

@@ -17,8 +17,15 @@ class HandDetector(abc.ABC):
     @abc.abstractmethod
     def detect(
             self, rgb_image: cv2.typing.MatLike
-            ) -> tuple[Optional[types.HandPose2D], Optional[types.HandPose2D]]:
-        """Detect hand landmarks from an RGB image."""
+            ) -> tuple[Optional[types.HandPose2D], Optional[types.HandPose2D],
+                       Optional[types.HandPose3D], Optional[types.HandPose3D]]:
+        """Detect hand landmarks from an RGB image.
+
+        Returns:
+            (left_2d, right_2d, left_world, right_world) where world landmarks
+            are metric 3D in a hand-centric frame (MediaPipe hand_world_landmarks)
+            or None when the detector does not produce them.
+        """
         raise NotImplementedError()
 
     @abc.abstractmethod
