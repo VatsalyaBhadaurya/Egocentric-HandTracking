@@ -109,8 +109,14 @@ class WilorHandDetector(hand_detector.HandDetector):
 
     def detect(
             self, rgb_image: cv2.typing.MatLike
-            ) -> tuple[Optional[types.HandPose2D], Optional[types.HandPose2D]]:
-        """Detect hand landmarks from an RGB image."""
+            ) -> tuple[Optional[types.HandPose2D], Optional[types.HandPose2D],
+                       Optional[types.HandPose3D], Optional[types.HandPose3D]]:
+        """Detect hand landmarks from an RGB image.
+
+        WiLoR does not produce hand-centric world landmarks, so the world
+        landmark slots are always None. 3D reconstruction for WiLoR is handled
+        separately through depth deprojection.
+        """
         results = self._wilor_pipeline.predict(rgb_image)
         left_hand_landmarks: Optional[types.HandPose2D] = None
         right_hand_landmarks: Optional[types.HandPose2D] = None
@@ -131,7 +137,7 @@ class WilorHandDetector(hand_detector.HandDetector):
         if self._enable_visualization:
             self._visualize(results, rgb_image)
 
-        return left_hand_landmarks, right_hand_landmarks
+        return left_hand_landmarks, right_hand_landmarks, None, None
 
     def _visualize(self, results: list, rgb_image: np.ndarray):
         """Visualize hand mesh using the renderer.

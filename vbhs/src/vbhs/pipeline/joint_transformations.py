@@ -34,6 +34,81 @@ from vbhs.pipeline import types
 from vbhs.config import config
 from vbhs.pipeline.hands import deprojection
 
+# Palm-base joints whose depth readings are large and stable — used as
+# anchors when aligning the hand_world_landmarks frame to camera space.
+_WORLD_ANCHOR_JOINTS = [
+    'WRIST',
+    'THUMB_MCP', 'INDEX_FINGER_MCP', 'MIDDLE_FINGER_MCP',
+    'RING_FINGER_MCP', 'PINKY_MCP',
+]
+
+# Fingertip and near-tip joints replaced with world-landmark-derived positions.
+# Tips are thin, boundary-hugging depth pixels → high noise; world landmarks
+# give accurate metric offsets for them.
+_WORLD_TIP_JOINTS = [
+    'THUMB_IP', 'THUMB_TIP',
+    'INDEX_FINGER_DIP', 'INDEX_FINGER_TIP',
+    'MIDDLE_FINGER_DIP', 'MIDDLE_FINGER_TIP',
+    'RING_FINGER_DIP', 'RING_FINGER_TIP',
+    'PINKY_DIP', 'PINKY_TIP',
+]
+
+
+def _refine_tips_with_world_landmarks(
+        cam_landmarks: types.HandPose3D,
+        world_landmarks: types.HandPose3D) -> types.HandPose3D:
+    """Replace depth-noisy fingertip positions using metric world landmark offsets.
+
+    Computes a rigid transform (R, t) from world-landmark space to camera space
+    using palm-base anchor joints, then applies it to the tip joints.  The
+    anchor joints (wrist + MCP row) sit on large, flat surfaces that depth
+    cameras resolve cleanly; using them to anchor the world frame keeps the
+    tips in the right absolute position while removing per-pixel depth noise.
+
+    Args:
+        cam_landmarks: Depth-deprojected landmarks in camera space (may be None
+            for individual keys when depth was invalid).
+        world_landmarks: MediaPipe hand_world_landmarks in hand-centric metric
+            frame (all 21 joints always present).
+
+    Returns:
+        A copy of cam_landmarks with tip joints replaced where possible.
+    """
+    # Gather corresponding anchor pairs (both must be valid in camera space).
+    cam_pts, world_pts = [], []
+    for key in _WORLD_ANCHOR_JOINTS:
+        c = cam_landmarks.get(key)
+        w = world_landmarks.get(key)
+        if c is not None and w is not None:
+            cam_pts.append(c)
+            world_pts.append(w)
+
+    if len(cam_pts) < 3:
+        # Too few anchors to estimate a reliable rotation — leave landmarks as-is.
+        return cam_landmarks
+
+    cam_arr = np.array(cam_pts, dtype=np.float64)
+    world_arr = np.array(world_pts, dtype=np.float64)
+
+    # Kabsch algorithm: least-squares rigid alignment of world → camera.
+    cam_c = cam_arr.mean(axis=0)
+    world_c = world_arr.mean(axis=0)
+    H = (world_arr - world_c).T @ (cam_arr - cam_c)
+    U, _, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+    if np.linalg.det(R) < 0:   # correct for reflection
+        Vt[-1] *= -1
+        R = Vt.T @ U.T
+    t = cam_c - R @ world_c
+
+    refined = dict(cam_landmarks)
+    for key in _WORLD_TIP_JOINTS:
+        w = world_landmarks.get(key)
+        if w is not None:
+            refined[key] = tuple((R @ np.array(w) + t).tolist())
+
+    return refined
+
 _logger = logging.getLogger(__name__)
 
 # TODO (isaac): this class should not do the visualization. That should be done in a separate class.
@@ -149,6 +224,10 @@ class CameraSpaceHandsFromImageSpace(
                     image_space_joints.left_hand_landmarks, depth_image, intrinsics,
                     self.depth_scale, self.min_depth_m, self.max_depth_m
                 )
+                if (left_hand_landmarks is not None
+                        and image_space_joints.left_world_landmarks is not None):
+                    left_hand_landmarks = _refine_tips_with_world_landmarks(
+                        left_hand_landmarks, image_space_joints.left_world_landmarks)
 
             # Convert right hand landmarks if detected
             right_hand_landmarks = None
@@ -157,6 +236,10 @@ class CameraSpaceHandsFromImageSpace(
                     image_space_joints.right_hand_landmarks, depth_image, intrinsics,
                     self.depth_scale, self.min_depth_m, self.max_depth_m
                 )
+                if (right_hand_landmarks is not None
+                        and image_space_joints.right_world_landmarks is not None):
+                    right_hand_landmarks = _refine_tips_with_world_landmarks(
+                        right_hand_landmarks, image_space_joints.right_world_landmarks)
 
             # Process landmarks for display and/or recording
             # Always call this method if mp4_output_dir is set (for depth recording)
